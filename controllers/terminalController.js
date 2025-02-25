@@ -35,8 +35,9 @@ const terminalController = {
           prompt: prompt, // 使用动态生成的提示词
           stream: false,
           options: {
-            temperature: 0.3, // 降低随机性保证数字准确性
+            temperature: 0.2, // 降低随机性保证数字准确性
             // num_predict: 150, // 控制最大输出长度
+            num_thread: 4, // 明确指定线程数
           },
         },
         {
@@ -63,17 +64,16 @@ const terminalController = {
         });
       }
 
-      // 尝试解析JSON
-      try {
-        const result = JSON.parse(response.data.response.trim());
-        res.json(result);
-      } catch (parseError) {
-        console.error("[JSON解析失败] 原始响应:", response.data.response);
-        res.status(500).json({
-          error: "响应格式无效",
-          invalidResponse: response.data.response,
-        });
-      }
+      // 直接返回原始响应数据
+      console.log("[原始响应]",response.data.response);
+      res.json({
+        success: true,
+        rawResponse: response.data.response, // 原始文本响应
+        metadata: {
+          model: response.data.model,
+          createdAt: new Date().toISOString(),
+        },
+      });
     } catch (error) {
       // 超时专项处理
       if (error.code === "ECONNABORTED") {
