@@ -19,12 +19,55 @@ const terminalController = {
       res.status(504).send("启动超时");
     });
     const { markdownTable, question } = req.body;
+    const prompt = `请严格按照以下步骤处理表格数据：
+1. 精准提取问题相关数据列
+2. 执行数学运算（加/减/乘/除/...）
+3. 生成标准化的Markdown表格
 
-    // 构造结构化提示词
-    const prompt = `请分析以下表格数据并回答问题：
-    ${markdownTable}
-    问题：${question}
-    回答时严格返回JSON格式: { "result": "计算结果" }`;
+输入格式：
+表格数据：
+${markdownTable}
+
+待解问题：${question}
+
+**标准示例：**
+[示例表格]
+| 产品   | 单价 | 销量 |
+|--------|------|------|
+| 手机   | 3000 | 120  |
+| 平板   | 2000 | 80   |
+
+[示例问题] 计算总销售额
+[正确响应]
+| 总销售额 |
+|----------|
+| 520000   |
+
+**异常处理示例：**
+[问题输入]
+待解问题：计算平均库存量
+
+[正确响应]
+| 平均库存量 |
+|------------|
+| null       |
+
+**强制规范：**
+1.禁止解释计算过程
+
+2.禁止修改原始表头名称
+
+3.数值保留原始精度
+
+4.表格必须包含完整边框
+
+**输出要求：**
+✅ 必须生成完整Markdown表格
+✅ 表头使用问题原文描述
+✅ 数值结果去除单位符号
+✅ 不可计算时显示null
+
+请严格按以上要求格式响应。`;
 
     try {
       // 带超时配置的请求
@@ -65,7 +108,7 @@ const terminalController = {
       }
 
       // 直接返回原始响应数据
-      console.log("[原始响应]",response.data.response);
+      console.log("[原始响应]", response.data.response);
       res.json({
         success: true,
         rawResponse: response.data.response, // 原始文本响应
@@ -99,6 +142,182 @@ const terminalController = {
           serviceHealth: "确认 ollama serve 运行正常",
         },
       });
+    }
+  },
+
+  askAiStreamVer: async (req, res) => {
+    // 配置流式响应头
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    // 初始化超时控制
+    let timeoutTimer = setTimeout(() => {
+      res.status(504).write("data: [超时] 响应时间超过45秒\n\n");
+      res.end();
+    }, 45000);
+
+    // 添加监控埋点
+    res.write(
+      `data: ${JSON.stringify({
+        _monitor: {
+          timestamp: Date.now(),
+          memory: process.memoryUsage().rss,
+        },
+      })}\n\n`
+    );
+
+    // 每秒发送心跳包
+    const heartbeat = setInterval(() => {
+      res.write(": heartbeat\n\n");
+    }, 1000);
+
+    // 终止心跳
+    res.on("close", () => {
+      clearInterval(heartbeat);
+    });
+
+    try {
+      const { markdownTable, question } = req.body;
+      const prompt = `请严格按照以下步骤处理表格数据：
+      1. 精准提取问题相关数据列
+      2. 执行数学运算（加/减/乘/除/...）
+      3. 生成标准化的Markdown表格
+      
+      输入格式：
+      表格数据：
+      ${markdownTable}
+      
+      待解问题：${question}
+      
+      **标准示例：**
+      [示例表格]
+      | 产品   | 单价 | 销量 |
+      |--------|------|------|
+      | 手机   | 3000 | 120  |
+      | 平板   | 2000 | 80   |
+      
+      [示例问题] 计算总销售额
+      [正确响应]
+      | 总销售额 |
+      |----------|
+      | 520000   |
+      
+      **异常处理示例：**
+      [问题输入]
+      待解问题：计算平均库存量
+      
+      [正确响应]
+      | 平均库存量 |
+      |------------|
+      | null       |
+      
+      **强制规范：**
+      1.禁止解释计算过程
+      
+      2.禁止修改原始表头名称
+      
+      3.数值保留原始精度
+      
+      4.表格必须包含完整边框
+      
+      **输出要求：**
+      ✅ 必须生成完整Markdown表格
+      ✅ 表头使用问题原文描述
+      ✅ 数值结果去除单位符号
+      ✅ 不可计算时显示null
+      
+      请严格按以上要求格式响应。`;
+
+      // 使用fetch API实现流式处理
+      const controller = new AbortController();
+      const response = await fetch("http://localhost:11434/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "deepseek-r1:1.5b",
+          prompt: prompt,
+          stream: true,
+          options: {
+            temperature: 0.2,
+            num_thread: 4,
+          },
+        }),
+        signal: controller.signal,
+      });
+
+      // 创建流处理器
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      // 流数据处理器
+      const processStream = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              clearTimeout(timeoutTimer);
+              res.write("data: [DONE]\n\n");
+              res.end();
+              return;
+            }
+
+            // 重置超时计时器
+            clearTimeout(timeoutTimer);
+            timeoutTimer = setTimeout(() => {
+              controller.abort();
+              res.write("data: [超时] 响应时间超过45秒\n\n");
+              res.end();
+            }, 45000);
+
+            // 处理数据块
+            buffer += decoder.decode(value, { stream: true });
+            const chunks = buffer.split("\n");
+            buffer = chunks.pop(); // 保留未完成数据
+
+            for (const chunk of chunks) {
+              if (chunk.trim()) {
+                try {
+                  const json = JSON.parse(chunk);
+                  // 发送有效数据
+                  res.write(
+                    `data: ${JSON.stringify({
+                      token: json.response,
+                      stats: {
+                        total_duration: json.total_duration,
+                        load_duration: json.load_duration,
+                      },
+                    })}\n\n`
+                  );
+                } catch (e) {
+                  console.error("JSON解析失败:", e);
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error("流处理异常:", error);
+          res.write(`data: ${JSON.stringify({ error: "流中断" })}\n\n`);
+          res.end();
+        }
+      };
+
+      await processStream();
+    } catch (error) {
+      clearTimeout(timeoutTimer);
+      if (error.name === "AbortError") {
+        res.write("data: [终止] 请求被取消\n\n");
+      } else {
+        console.error("服务端错误:", error);
+        res.write(
+          `data: ${JSON.stringify({
+            error: "服务异常",
+            details: error.message,
+          })}\n\n`
+        );
+      }
+      res.end();
     }
   },
 
@@ -211,7 +430,7 @@ const terminalController = {
     // 使用示例
     checkAndRestartOllama(() => {
       console.log("服务重启完成");
-      res.status(200).send("Ollama服务启动成功");
+      res.status(200).json({ message: "Ollama服务启动成功" });
     });
   },
 };
