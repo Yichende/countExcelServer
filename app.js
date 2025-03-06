@@ -55,6 +55,13 @@ const bodyParser = require("body-parser");
 app.use(bodyParser.json()); // 解析 JSON 格式的请求体
 app.use(bodyParser.urlencoded({ extended: true })); // 解析 URL 编码格式的请求体
 
+//调试监听
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  console.log("Request body:", req.body);
+  next();
+});
+
 // 监听端口
 const port = process.env.PORT || 3001;
 app.listen(port, () => {
