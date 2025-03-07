@@ -4,6 +4,63 @@ const fetch = require("node-fetch");
 
 const sessionStore = new Map();
 
+const buildPrompt = (sessionData) => {
+  const cleanTable = sessionData.markdownTable
+    .replace(/\t/g, "|") // 转换制表符
+    .replace(/\|+/g, "|") // 合并连续分隔符
+    .replace(/,/g, "") // 去除数字中的逗号
+    .trim();
+  return `请严格按照以下步骤处理表格数据：
+1. 精准提取问题相关数据列
+2. 执行数学运算（加/减/乘/除/...）
+3. 生成标准化的Markdown表格
+
+输入格式：
+表格数据：
+${cleanTable}
+
+待解问题：${sessionData.question}
+
+**标准示例：**
+[示例表格]
+| 产品   | 单价 | 销量 |
+|--------|------|------|
+| 手机   | 3000 | 120  |
+| 平板   | 2000 | 80   |
+
+[示例问题] 计算总销售额
+[正确响应]
+| 总销售额 |
+|----------|
+| 520000   |
+
+**异常处理示例：**
+[问题输入]
+待解问题：计算平均库存量
+
+[正确响应]
+| 平均库存量 |
+|------------|
+| null       |
+
+**强制规范：**
+1.禁止解释计算过程
+
+2.禁止修改原始表头名称
+
+3.数值保留原始精度
+
+4.表格必须包含完整边框
+
+**输出要求：**
+✅ 必须生成完整Markdown表格
+✅ 表头使用问题原文描述
+✅ 数值结果去除单位符号
+✅ 不可计算时显示null
+
+请严格按以上要求格式响应。`;
+};
+
 const terminalController = {
   test: async (req, res) => {
     console.log("Im Controller");
@@ -167,14 +224,14 @@ ${markdownTable}
       // 定时清理
       setTimeout(() => sessionStore.delete(sessionId), 600000);
 
-      res.json({ 
+      res.json({
         status: "success",
-        sessionId 
+        sessionId,
       });
     } catch (error) {
       res.status(500).json({
         error: "SERVER_ERROR",
-        message: error.message
+        message: error.message,
       });
     }
   },
@@ -182,9 +239,7 @@ ${markdownTable}
   askAiStreamVer: async (req, res) => {
     try {
       const { markdownTable, question } = req.body;
-      const sessionId = `sess_${Date.now()}_${Math.random()
-        .toString(36)
-        .slice(2, 11)}`;
+      const sessionId = crypto.randomUUID();
 
       // 存储会话数据（设置10分钟过期）
       sessionStore.set(sessionId, {
@@ -206,6 +261,9 @@ ${markdownTable}
   handleStream: async (req, res) => {
     const { sessionId } = req.params;
     const sessionData = sessionStore.get(sessionId);
+    let isStreamEnded = false; // 状态标志
+    // 流引用容器
+    let streamRef = null;
 
     // 验证会话
     if (!sessionData) {
@@ -218,23 +276,198 @@ ${markdownTable}
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    // 模拟流式生成
-    const mockResponse = "| 总销量 |\n|--------|\n| 37800 |";
-    const tokens = mockResponse.split("");
+    let timeoutTimer;
+    // 创建AbortController控制超时
+    const controller = new AbortController();
 
-    // 逐字发送
-    const sendToken = () => {
-      if (tokens.length === 0) {
-        res.write("data: [DONE]\n\n");
+    try {
+      // Ollama请求
+      const response = await axios.post(
+        "http://localhost:11434/api/generate",
+        {
+          model: "deepseek-r1:1.5b",
+          prompt: buildPrompt(sessionData),
+          stream: true,
+          options: {
+            temperature: 0.2,
+            num_thread: 4,
+          },
+        },
+        {
+          responseType: "stream", // 关键配置
+          transitional: {
+            forcedJSONParsing: false, // 禁用自动JSON解析
+          },
+          timeout: 45000,
+          signal: controller.signal,
+        }
+      );
+
+      // HTTP状态码检查
+      if (response.status !== 200) {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({
+            code: "HTTP_" + response.status,
+            details: "Ollama服务异常",
+          })}\n\n`
+        );
         return res.end();
       }
 
-      const token = tokens.shift();
-      res.write(`data: ${JSON.stringify({ token })}\n\n`);
-      setTimeout(sendToken, 50); // 控制流速
-    };
+      // 获取Node.js可读流
+      streamRef = response.data;
+      const stream = response.data;
 
-    sendToken();
+      // 初始化数据处理器
+      let buffer = "";
+      let fullResponse = "";
+
+      // 超时处理
+      timeoutTimer = setTimeout(() => {
+        safeEnd('event: timeout\ndata: {"msg":"响应超时"}\n\n');
+      }, 45000);
+
+      // 写锁机制
+      let isWriting = false;
+      let pendingWrites = [];
+
+      const safeWrite = (data) => {
+        if (isStreamEnded || res.headersSent) return; // 增强检查
+
+        if (!isWriting) {
+          isWriting = true;
+          const canContinue = res.write(data);
+          isWriting = false;
+
+          if (canContinue && pendingWrites.length > 0) {
+            const nextData = pendingWrites.shift();
+            safeWrite(nextData);
+          }
+        } else {
+          pendingWrites.push(data);
+        }
+      };
+
+      // 统一响应终止方法
+      const safeEnd = (msg) => {
+        if (!isStreamEnded) {
+          console.log('[连接终止] 原因:', msg); //test!
+
+          isStreamEnded = true;
+          pendingWrites = []; // 清空队列
+
+          // 移除所有流监听器
+          if (streamRef) {
+            streamRef.removeAllListeners();
+          }
+
+          clearTimeout(timeoutTimer);
+          res.write(msg);
+          res.end();
+          sessionStore.delete(sessionId);
+        }
+        if (stream && !stream.destroyed) {
+          stream.destroy();
+        }
+      };
+
+      // 流数据处理
+      stream.on("data", (chunk) => {
+        if (isStreamEnded) return;
+        clearTimeout(timeoutTimer);
+        // 超时处理
+        timeoutTimer = setTimeout(() => {
+          safeEnd('event: timeout\ndata: {"msg":"响应超时"}\n\n');
+        }, 45000);
+
+        try {
+          buffer += chunk.toString();
+
+          // 按换行符分割数据块（Ollama每行一个JSON）
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || ""; // 保留未完成的行
+
+          // 处理每行数据
+          lines.forEach((line) => {
+            if (!line.trim() || isStreamEnded) return; // 前置状态检查
+
+            try {
+              const json = JSON.parse(line);
+              // console.log("[Ollama原始响应]", JSON.stringify(json, null, 2)); //test!
+
+              // 有效数据判断
+              if (json.response && !json.done) {
+                fullResponse += json.response;
+
+                console.log(
+                  "[即将发送] 字符数:",
+                  json.response.length,
+                  "内容:",
+                  json.response.replace(/\n/g, "\\n")
+                ); // test!
+
+                const sendData = `data: ${JSON.stringify({
+                  token: json.response,
+                  stats: {
+                    eval_count: json.eval_count,
+                    eval_duration: json.eval_duration,
+                  },
+                })}\n\n`;
+
+                console.log("[SSE数据包]", sendData.replace(/\n/g, "\\n")); //test!
+                safeWrite(sendData);
+              }
+            } catch (e) {
+              console.error("[流解析错误] 原始数据:", line);
+            }
+          });
+
+          // 内存保护
+          if (buffer.length > 1024 * 1024) {
+            // 1MB限制
+            console.warn("缓冲区溢出风险，清空缓冲");
+            buffer = "";
+          }
+        } catch (error) {
+          console.error("数据处理异常:", error);
+        }
+      });
+
+      // 流结束事件
+      stream.once("end", () => {
+        pendingWrites = []; // 清空队列
+        safeEnd("data: [DONE]\n\n");
+      });
+
+      // 流错误处理
+      stream.on("error", (err) => {
+        safeEnd(
+          `event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`
+        );
+      });
+    } catch (error) {
+      safeEnd(
+        `event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`
+      );
+    }
+
+    // // 模拟流式生成
+    // const mockResponse = "| 总销量 |\n|--------|\n| 37800 |";
+    // const tokens = mockResponse.split("");
+
+    // // 逐字发送
+    // const sendToken = () => {
+    //   if (tokens.length === 0) {
+    //     res.write("data: [DONE]\n\n");
+    //     return res.end();
+    //   }
+
+    //   const token = tokens.shift();
+    //   res.write(`data: ${JSON.stringify({ token })}\n\n`);
+    //   setTimeout(sendToken, 50); // 控制流速
+    // };
+
+    // sendToken();
   },
 
   startOllama: async (req, res) => {
