@@ -291,6 +291,8 @@ ${markdownTable}
           options: {
             temperature: 0.2,
             num_thread: 4,
+            repeat_penalty: 1.2, // 降低重复
+            top_k: 40, // 增加输出多样性
           },
         },
         {
@@ -331,18 +333,58 @@ ${markdownTable}
       let isWriting = false;
       let pendingWrites = [];
 
+      // const safeWrite = (data) => {
+      //   if (isStreamEnded || res.headersSent) return; // 增强检查
+      //   // 增加可写状态检查
+      //   if (isStreamEnded || !res.writable) {
+      //     console.warn("尝试在关闭的流上写入");
+      //     return;
+      //   }
+
+      //   if (!isWriting) {
+      //     isWriting = true;
+      //     const canContinue = res.write(data);
+      //     isWriting = false;
+
+      //     if (canContinue && pendingWrites.length > 0) {
+      //       const nextData = pendingWrites.shift();
+      //       safeWrite(nextData);
+      //     }
+      //   } else {
+      //     pendingWrites.push(data);
+      //   }
+      // };
+
       const safeWrite = (data) => {
-        if (isStreamEnded || res.headersSent) return; // 增强检查
-
-        if (!isWriting) {
+        if (isStreamEnded || !res.writable) return;
+      
+        // 移除 res.headersSent 检查 [!code --]
+        // 添加队列系统状态检查 [!code ++]
+        if (typeof isWriting === 'undefined') isWriting = false;
+      
+        const writeData = () => {
           isWriting = true;
-          const canContinue = res.write(data);
-          isWriting = false;
-
-          if (canContinue && pendingWrites.length > 0) {
-            const nextData = pendingWrites.shift();
-            safeWrite(nextData);
+          const canContinue = res.write(data, (err) => {
+            if (err) {
+              console.error('写入失败:', err);
+              safeEnd('error');
+            }
+            isWriting = false;
+            
+            // 处理等待队列
+            if (pendingWrites.length > 0) {
+              const next = pendingWrites.shift();
+              writeData(next);
+            }
+          });
+      
+          if (!canContinue) {
+            console.log('流背压出现，暂停写入');
           }
+        };
+      
+        if (!isWriting) {
+          writeData();
         } else {
           pendingWrites.push(data);
         }
@@ -351,7 +393,7 @@ ${markdownTable}
       // 统一响应终止方法
       const safeEnd = (msg) => {
         if (!isStreamEnded) {
-          console.log('[连接终止] 原因:', msg); //test!
+          console.log("[连接终止] 原因:", msg); //test!
 
           isStreamEnded = true;
           pendingWrites = []; // 清空队列
@@ -363,11 +405,37 @@ ${markdownTable}
 
           clearTimeout(timeoutTimer);
           res.write(msg);
-          res.end();
-          sessionStore.delete(sessionId);
+
+          // 延迟关闭连接
+          setTimeout(() => {
+            res.end();
+            sessionStore.delete(sessionId);
+          }, 1000); // 1000ms 延迟
         }
         if (stream && !stream.destroyed) {
           stream.destroy();
+        }
+      };
+
+      // 修改流处理核心逻辑
+      let isFirstChunk = true;
+
+      const processOllamaChunk = (json) => {
+        if (json.response && !json.done) {
+          // 数据清洗
+          const cleanedResponse = json.response
+            .replace(/\n/g, '\\n')  // 转义换行符
+            .replace(/\r/g, '\\r'); // 转义回车符
+          
+          // 生成符合 SSE 规范的负载 [!code ++]
+          const payload = `data: ${JSON.stringify({ token: cleanedResponse })}\n\n`;
+          safeWrite(payload);
+          
+          console.log('[发送数据]', payload); // 调试日志
+        }
+        
+        if (json.done) {
+          safeWrite('data: [DONE]\n\n');
         }
       };
 
@@ -395,28 +463,23 @@ ${markdownTable}
               const json = JSON.parse(line);
               // console.log("[Ollama原始响应]", JSON.stringify(json, null, 2)); //test!
 
+              // 处理首块特殊逻辑
+              if (isFirstChunk) {
+                isFirstChunk = false;
+                res.flushHeaders(); // 确保头部发送
+              }
+
               // 有效数据判断
               if (json.response && !json.done) {
-                fullResponse += json.response;
-
                 console.log(
                   "[即将发送] 字符数:",
                   json.response.length,
                   "内容:",
                   json.response.replace(/\n/g, "\\n")
                 ); // test!
-
-                const sendData = `data: ${JSON.stringify({
-                  token: json.response,
-                  stats: {
-                    eval_count: json.eval_count,
-                    eval_duration: json.eval_duration,
-                  },
-                })}\n\n`;
-
-                console.log("[SSE数据包]", sendData.replace(/\n/g, "\\n")); //test!
-                safeWrite(sendData);
               }
+
+              processOllamaChunk(json);
             } catch (e) {
               console.error("[流解析错误] 原始数据:", line);
             }
@@ -446,7 +509,7 @@ ${markdownTable}
         );
       });
     } catch (error) {
-      safeEnd(
+      console.error(
         `event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`
       );
     }

@@ -61,6 +61,17 @@ app.use((req, res, next) => {
   console.log("Request body:", req.body);
   next();
 });
+// SSE 配置
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "http://localhost:5173");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Expose-Headers", "Content-Type"); // 新增
+  if (req.method === 'OPTIONS') {
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    return res.status(200).end();
+  }
+  next();
+});
 
 // 监听端口
 const port = process.env.PORT || 3001;
