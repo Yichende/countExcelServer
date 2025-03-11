@@ -61,6 +61,34 @@ ${cleanTable}
 请严格按以上要求格式响应。`;
 };
 
+// 检测端口是否被占用（服务是否运行）
+const checkPortInUse = (port = 11434) => {
+  return new Promise((resolve) => {
+    const command =
+      process.platform === "win32"
+        ? `netstat -ano | findstr :${port}`
+        : `lsof -i :${port} -t`;
+
+    exec(command, (err, stdout) => {
+      if (err) {
+        // 命令执行失败视为端口未使用
+        resolve(false);
+        return;
+      }
+
+      // Windows解析
+      if (process.platform === "win32") {
+        const lines = stdout.trim().split("\n");
+        resolve(lines.length > 0);
+      }
+      // Linux/macOS解析
+      else {
+        resolve(stdout.trim().length > 0);
+      }
+    });
+  });
+};
+
 const terminalController = {
   test: async (req, res) => {
     console.log("Im Controller");
@@ -120,8 +148,10 @@ ${markdownTable}
 
 4.表格必须包含完整边框
 
+5.不允许出现内容数值为空白的表格
+
 **输出要求：**
-✅ 必须生成完整Markdown表格
+✅ 必须生成且只生成完整Markdown格式表格
 ✅ 表头使用问题原文描述
 ✅ 数值结果去除单位符号
 ✅ 不可计算时显示null
@@ -133,7 +163,7 @@ ${markdownTable}
       const response = await axios.post(
         "http://localhost:11434/api/generate",
         {
-          model: "deepseek-r1:1.5b",
+          model: "deepseek-r1:7b",
           prompt: prompt, // 使用动态生成的提示词
           stream: false,
           options: {
@@ -207,6 +237,13 @@ ${markdownTable}
   // 初始化会话
   initStreamSession: async (req, res) => {
     try {
+      const isOllamaRunning = await checkPortInUse();
+      if (!isOllamaRunning) {
+        return res.status(503).json({
+          error: "SERVICE_UNAVAILABLE",
+          message: "Ollama服务未运行",
+        });
+      }
       // 验证请求体
       if (!req.body?.markdownTable || !req.body?.question) {
         return res.status(400).json({ error: "缺少必要参数" });
@@ -264,6 +301,10 @@ ${markdownTable}
     let isStreamEnded = false; // 状态标志
     // 流引用容器
     let streamRef = null;
+    let stream = null;
+    // 写锁机制
+    let isWriting = false;
+    let pendingWrites = [];
 
     // 验证会话
     if (!sessionData) {
@@ -279,6 +320,33 @@ ${markdownTable}
     let timeoutTimer;
     // 创建AbortController控制超时
     const controller = new AbortController();
+
+    // 统一响应终止方法
+    const safeEnd = (msg) => {
+      if (!isStreamEnded) {
+        console.log("[连接终止] 原因:", msg); //test!
+
+        isStreamEnded = true;
+        pendingWrites = []; // 清空队列
+
+        // 移除所有流监听器
+        if (streamRef) {
+          streamRef.removeAllListeners();
+        }
+
+        clearTimeout(timeoutTimer);
+        res.write(msg);
+
+        // 延迟关闭连接
+        setTimeout(() => {
+          res.end();
+          sessionStore.delete(sessionId);
+        }, 1000); // 1000ms 延迟
+      }
+      if (stream && !stream.destroyed) {
+        stream.destroy();
+      }
+    };
 
     try {
       // Ollama请求
@@ -318,102 +386,47 @@ ${markdownTable}
 
       // 获取Node.js可读流
       streamRef = response.data;
-      const stream = response.data;
+      stream = response.data;
 
       // 初始化数据处理器
       let buffer = "";
-      let fullResponse = "";
 
       // 超时处理
       timeoutTimer = setTimeout(() => {
         safeEnd('event: timeout\ndata: {"msg":"响应超时"}\n\n');
       }, 45000);
 
-      // 写锁机制
-      let isWriting = false;
-      let pendingWrites = [];
-
-      // const safeWrite = (data) => {
-      //   if (isStreamEnded || res.headersSent) return; // 增强检查
-      //   // 增加可写状态检查
-      //   if (isStreamEnded || !res.writable) {
-      //     console.warn("尝试在关闭的流上写入");
-      //     return;
-      //   }
-
-      //   if (!isWriting) {
-      //     isWriting = true;
-      //     const canContinue = res.write(data);
-      //     isWriting = false;
-
-      //     if (canContinue && pendingWrites.length > 0) {
-      //       const nextData = pendingWrites.shift();
-      //       safeWrite(nextData);
-      //     }
-      //   } else {
-      //     pendingWrites.push(data);
-      //   }
-      // };
-
       const safeWrite = (data) => {
         if (isStreamEnded || !res.writable) return;
-      
-        // 移除 res.headersSent 检查 [!code --]
-        // 添加队列系统状态检查 [!code ++]
-        if (typeof isWriting === 'undefined') isWriting = false;
-      
+
+        // 添加队列系统状态检查
+        if (typeof isWriting === "undefined") isWriting = false;
+
         const writeData = () => {
           isWriting = true;
           const canContinue = res.write(data, (err) => {
             if (err) {
-              console.error('写入失败:', err);
-              safeEnd('error');
+              console.error("写入失败:", err);
+              safeEnd("error");
             }
             isWriting = false;
-            
+
             // 处理等待队列
             if (pendingWrites.length > 0) {
               const next = pendingWrites.shift();
               writeData(next);
             }
           });
-      
+
           if (!canContinue) {
-            console.log('流背压出现，暂停写入');
+            console.log("流背压出现，暂停写入");
           }
         };
-      
+
         if (!isWriting) {
           writeData();
         } else {
           pendingWrites.push(data);
-        }
-      };
-
-      // 统一响应终止方法
-      const safeEnd = (msg) => {
-        if (!isStreamEnded) {
-          console.log("[连接终止] 原因:", msg); //test!
-
-          isStreamEnded = true;
-          pendingWrites = []; // 清空队列
-
-          // 移除所有流监听器
-          if (streamRef) {
-            streamRef.removeAllListeners();
-          }
-
-          clearTimeout(timeoutTimer);
-          res.write(msg);
-
-          // 延迟关闭连接
-          setTimeout(() => {
-            res.end();
-            sessionStore.delete(sessionId);
-          }, 1000); // 1000ms 延迟
-        }
-        if (stream && !stream.destroyed) {
-          stream.destroy();
         }
       };
 
@@ -424,18 +437,20 @@ ${markdownTable}
         if (json.response && !json.done) {
           // 数据清洗
           const cleanedResponse = json.response
-            .replace(/\n/g, '\\n')  // 转义换行符
-            .replace(/\r/g, '\\r'); // 转义回车符
-          
+            .replace(/\n/g, "\\n") // 转义换行符
+            .replace(/\r/g, "\\r"); // 转义回车符
+
           // 生成符合 SSE 规范的负载 [!code ++]
-          const payload = `data: ${JSON.stringify({ token: cleanedResponse })}\n\n`;
+          const payload = `data: ${JSON.stringify({
+            token: cleanedResponse,
+          })}\n\n`;
           safeWrite(payload);
-          
-          console.log('[发送数据]', payload); // 调试日志
+
+          console.log("[发送数据]", payload); // 调试日志
         }
-        
+
         if (json.done) {
-          safeWrite('data: [DONE]\n\n');
+          safeWrite("data: [DONE]\n\n");
         }
       };
 
@@ -510,27 +525,12 @@ ${markdownTable}
       });
     } catch (error) {
       console.error(
-        `event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`
+        `event: Ollamaerror\ndata: ${JSON.stringify({
+          error: error.message,
+        })}\n\n`
       );
+      safeEnd();
     }
-
-    // // 模拟流式生成
-    // const mockResponse = "| 总销量 |\n|--------|\n| 37800 |";
-    // const tokens = mockResponse.split("");
-
-    // // 逐字发送
-    // const sendToken = () => {
-    //   if (tokens.length === 0) {
-    //     res.write("data: [DONE]\n\n");
-    //     return res.end();
-    //   }
-
-    //   const token = tokens.shift();
-    //   res.write(`data: ${JSON.stringify({ token })}\n\n`);
-    //   setTimeout(sendToken, 50); // 控制流速
-    // };
-
-    // sendToken();
   },
 
   startOllama: async (req, res) => {
@@ -643,6 +643,57 @@ ${markdownTable}
     checkAndRestartOllama(() => {
       console.log("服务重启完成");
       res.status(200).json({ message: "Ollama服务启动成功" });
+    });
+  },
+
+  shutdownOllama: async (req, res) => {
+    const isRunningBefore = await checkPortInUse();
+
+    if (!isRunningBefore) {
+      return res.json({
+        success: true,
+        message: "服务未在运行",
+        isRunning: false,
+      });
+    }
+
+    const stopOllama = async () => {
+      try {
+        const isRunning = await checkPortInUse();
+        if (!isRunning) return false;
+        const command = "taskkill /IM ollama.exe /F";
+
+        return new Promise((resolve) => {
+          exec(command, (err) => {
+            if (err) {
+              console.error("关闭失败:", err);
+              resolve(false);
+              return;
+            }
+
+            // 二次验证
+            setTimeout(async () => {
+              const stillRunning = await checkPortInUse();
+              resolve(!stillRunning);
+            }, 1000); // 给予1秒关闭时间
+          });
+        });
+      } catch (error) {
+        console.error("关闭异常:", error);
+        return false;
+      }
+    };
+
+    const shutdownSuccess = await stopOllama();
+    const isRunningAfter = await checkPortInUse();
+
+    res.json({
+      success: shutdownSuccess && !isRunningAfter,
+      message:
+        shutdownSuccess && !isRunningAfter
+          ? "服务已成功关闭"
+          : "关闭操作未完全生效",
+      isRunning: isRunningAfter,
     });
   },
 };
