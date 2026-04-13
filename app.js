@@ -1,15 +1,16 @@
-var createError = require('http-errors');
-var express = require('express');
-var path = require('path');
-var cookieParser = require('cookie-parser');
-var logger = require('morgan');
+const createError = require('http-errors');
+const express = require('express');
+const { ensureOllama } = require('./services/ollamaManager')
+const path = require('path');
+const cookieParser = require('cookie-parser');
+const logger = require('morgan');
 
 
-var indexRouter = require('./routes/index');
-var usersRouter = require('./routes/users');
+const indexRouter = require('./routes/index');
+const usersRouter = require('./routes/users');
 const terminalRouters = require('./routes/terminal/terminalRoutes')
 
-var app = express();
+const app = express();
 
 // 跨域处理
 const cors = require('cors');
@@ -30,6 +31,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// router
 app.use('/', indexRouter);
 app.use('/users', usersRouter);
 app.use(terminalRouters)
@@ -51,9 +53,9 @@ app.use(function(err, req, res, next) {
 });
 
 // body解析
-const bodyParser = require("body-parser");
-app.use(bodyParser.json()); // 解析 JSON 格式的请求体
-app.use(bodyParser.urlencoded({ extended: true })); // 解析 URL 编码格式的请求体
+// const bodyParser = require("body-parser");
+// app.use(bodyParser.json()); // 解析 JSON 格式的请求体
+// app.use(bodyParser.urlencoded({ extended: true })); // 解析 URL 编码格式的请求体
 
 //调试监听
 app.use((req, res, next) => {
@@ -63,9 +65,9 @@ app.use((req, res, next) => {
 });
 // SSE 配置
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "http://localhost:5173");
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
   res.header("Access-Control-Allow-Headers", "Content-Type");
-  res.header("Access-Control-Expose-Headers", "Content-Type"); // 新增
+  res.header("Access-Control-Expose-Headers", "Content-Type");
   if (req.method === 'OPTIONS') {
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     return res.status(200).end();
@@ -75,7 +77,21 @@ app.use((req, res, next) => {
 
 // 监听端口
 const port = process.env.PORT || 3001;
-app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
-});
+
+async function startServer() {
+  try {
+    console.log('[Ollama] checkout server...');
+    await ensureOllama();
+
+    app.listen(port, () => {
+      console.log(`Server is running on http://localhost:${port}`);
+    });
+  } catch(err){
+    console.error('server start fail', err.message);
+    process.exit(1);
+  }
+}
+
+startServer();
+
 module.exports = app;
