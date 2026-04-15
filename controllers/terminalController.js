@@ -283,10 +283,12 @@ ${markdownTable}
 
       // 生成会话ID
       const sessionId = crypto.randomUUID();
+      const abController = new AbortController();
 
       // 存储会话数据（设置10分钟过期）
       sessionStore.set(sessionId, {
         ...req.body,
+        abController,
         createdAt: Date.now(),
       });
 
@@ -350,8 +352,6 @@ ${markdownTable}
     res.setHeader("Connection", "keep-alive");
 
     let timeoutTimer;
-    // 创建AbortController控制超时
-    const controller = new AbortController();
 
     // 统一响应终止方法
     const safeEnd = (msg) => {
@@ -361,19 +361,41 @@ ${markdownTable}
         isStreamEnded = true;
         pendingWrites = []; // 清空队列
 
+        if (sessionData?.abController) {
+          try {
+            sessionData.abController.abort();
+          } catch (err) {
+            console.warn("AbortController fail");
+          }
+        }
+
+        // 销毁流
+        if (stream && !stream.destroyed) {
+          stream.destroy();
+        }
+
         // 移除所有流监听器
         if (streamRef) {
           streamRef.removeAllListeners();
         }
 
         clearTimeout(timeoutTimer);
-        res.write(msg);
 
-        // 延迟关闭连接
-        setTimeout(() => {
+        // 防止写入已关闭流
+        if (!res.writableEnded && !res.destroyed) {
+          try {
+            res.write(msg || "");
+          } catch (err) {
+            console.warn("write failed (connect close)");
+          }
+        }
+
+        // 关闭连接
+        if (!res.writableEnded) {
           res.end();
+          sessionData.abController.abort();
           sessionStore.delete(sessionId);
-        }, 1000); // 1000ms 延迟
+        }
       }
       if (stream && !stream.destroyed) {
         stream.destroy();
@@ -401,7 +423,7 @@ ${markdownTable}
             forcedJSONParsing: false, // 禁用自动JSON解析
           },
           timeout: 45000,
-          signal: controller.signal,
+          signal: sessionData.abController.signal,
         }
       );
 
@@ -429,12 +451,18 @@ ${markdownTable}
       }, 45000);
 
       const safeWrite = (data) => {
-        if (isStreamEnded || !res.writable) return;
+        if (isStreamEnded || !res.writable || res.destroyed || !res.writable)
+          return;
 
         // 添加队列系统状态检查
         if (typeof isWriting === "undefined") isWriting = false;
 
         const writeData = () => {
+          if (res.writableEnded || res.destroyed) {
+            console.warn("res closed, stop writing");
+            safeEnd("closed");
+            return;
+          }
           isWriting = true;
           const canContinue = res.write(data, (err) => {
             if (err) {
@@ -545,24 +573,44 @@ ${markdownTable}
 
       // 流结束事件
       stream.once("end", () => {
-        pendingWrites = []; // 清空队列
-        safeEnd("data: [DONE]\n\n");
+        if (!isStreamEnded) {
+          pendingWrites = []; // 清空队列
+          safeEnd("data: [DONE]\n\n");
+        }
       });
 
       // 流错误处理
       stream.on("error", (err) => {
-        safeEnd(
-          `event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`
-        );
+        if (!isStreamEnded) {
+          safeEnd(  
+            `event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`
+          );
+        }
       });
     } catch (error) {
-      console.error(
-        `event: Ollamaerror\ndata: ${JSON.stringify({
-          error: error.message,
-        })}\n\n`
-      );
+      if (error.name === "AbortError") {
+        console.log("Stream Abort");
+      } else {
+        console.error(
+          `event: Ollamaerror\ndata: ${JSON.stringify({
+            error: error.message,
+          })}\n\n`
+        );
+      }
       safeEnd();
     }
+
+    req.on("close", () => {
+
+      if (sessionData?.abController) {
+        sessionData.abController.abort();
+        console.log('client abort');
+      }
+
+      if (!isStreamEnded) {
+        safeEnd("client closed");
+      }
+    });
   },
 
   startOllama: async (req, res) => {
